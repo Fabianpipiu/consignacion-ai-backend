@@ -10,14 +10,10 @@ import OpenAI from "openai";
 const app = express();
 app.set("trust proxy", 1);
 app.use(cors({ origin: "*" }));
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "12mb" }));
 
 /* ======================================================
-   1) Firebase Admin (OPCIONAL)
-   - En Render NO lo exigimos
-   - Solo se activa si existe:
-     FIREBASE_SERVICE_ACCOUNT_JSON  (recomendado)
-     o FIREBASE_SERVICE_ACCOUNT_PATH (local)
+   Firebase Admin (OPCIONAL)
 ====================================================== */
 function tryInitFirebase() {
   try {
@@ -26,7 +22,6 @@ function tryInitFirebase() {
     const jsonInline = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
     const p = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
 
-    // ✅ Preferido: JSON por env
     if (jsonInline && jsonInline.trim().length > 0) {
       const json = JSON.parse(jsonInline);
       admin.initializeApp({ credential: admin.credential.cert(json) });
@@ -34,7 +29,6 @@ function tryInitFirebase() {
       return { enabled: true, mode: "json_env" };
     }
 
-    // ✅ Alternativa: path a archivo (ideal solo local)
     if (p && p.trim().length > 0) {
       const absPath = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
       const raw = fs.readFileSync(absPath, "utf8");
@@ -47,16 +41,15 @@ function tryInitFirebase() {
     console.log("ℹ️ Firebase Admin NO inicializado (no env vars). OK para Render.");
     return { enabled: false, mode: "disabled" };
   } catch (e) {
-    console.error("⚠️ Firebase Admin NO pudo inicializar:", e?.message || e);
-    console.log("ℹ️ Continuamos sin Firebase Admin (no es necesario para verify-consignacion).");
+    console.error("⚠️ Firebase Admin init error:", e?.message || e);
+    console.log("ℹ️ Continuamos sin Firebase Admin.");
     return { enabled: false, mode: "error" };
   }
 }
-
 const fb = tryInitFirebase();
 
 /* ======================================================
-   2) OpenAI (REQUIRED para IA real)
+   OpenAI helper
 ====================================================== */
 function getOpenAI() {
   const key = process.env.OPENAI_API_KEY;
@@ -66,34 +59,42 @@ function getOpenAI() {
   return new OpenAI({ apiKey: key });
 }
 
+function short(s, n = 140) {
+  if (!s) return "";
+  return String(s).length > n ? String(s).slice(0, n) + "..." : String(s);
+}
+
 /* ======================================================
-   3) Health endpoints
+   Health
 ====================================================== */
 app.get("/", (_, res) => {
   res.json({
     ok: true,
     service: "consignacion-ai-backend",
     firebaseAdmin: fb,
+    hasOpenAIKey: !!process.env.OPENAI_API_KEY,
+    model: process.env.AI_MODEL || "gpt-4o-mini",
     time: new Date().toISOString(),
   });
 });
 
-app.get("/health", (_, res) => {
-  res.json({ ok: true });
-});
+app.get("/health", (_, res) => res.json({ ok: true }));
 
 /* ======================================================
-   4) verify-consignacion (ALINEADO con Flutter)
-   Body: { imageUrl, expectedAmount, expectedDate }
+   verify-consignacion
 ====================================================== */
 app.post("/verify-consignacion", async (req, res) => {
   const t0 = Date.now();
+  const reqId = Math.random().toString(16).slice(2, 10);
+
   try {
     const { imageUrl, expectedAmount, expectedDate } = req.body || {};
 
-    console.log("---- /verify-consignacion HIT ----");
-    console.log("time:", new Date().toISOString());
-    console.log("body:", { imageUrl: (imageUrl || "").slice(0, 80), expectedAmount, expectedDate });
+    console.log(`\n[${reqId}] ---- /verify-consignacion HIT ----`);
+    console.log(`[${reqId}] time:`, new Date().toISOString());
+    console.log(`[${reqId}] imageUrl:`, short(imageUrl, 120));
+    console.log(`[${reqId}] expectedAmount:`, expectedAmount);
+    console.log(`[${reqId}] expectedDate:`, expectedDate);
 
     if (!imageUrl || expectedAmount == null || !expectedDate) {
       return res.status(400).json({
@@ -105,12 +106,12 @@ app.post("/verify-consignacion", async (req, res) => {
     }
 
     const openai = getOpenAI();
+    const model = process.env.AI_MODEL || "gpt-4o-mini";
 
     const system =
       "Eres un verificador de comprobantes de consignación en Colombia. " +
-      "Extrae monto, fecha y banco/billetera (Nequi, Daviplata, Bancolombia, etc). " +
-      "Compara con lo esperado y responde SOLO JSON válido. " +
-      "Si no puedes leer el comprobante, responde pendiente_revision con baja confianza.";
+      "Extrae monto, fecha y banco/billetera. " +
+      "Compara con lo esperado y responde SOLO JSON válido.";
 
     const user = `DATOS ESPERADOS:
 - expectedAmount: ${expectedAmount}
@@ -124,10 +125,10 @@ Devuelve SOLO este JSON (sin texto adicional):
   "reasons": string[]
 }`;
 
-    console.log("OpenAI model:", process.env.AI_MODEL || "gpt-4o-mini");
+    console.log(`[${reqId}] OpenAI model: ${model}`);
 
     const response = await openai.responses.create({
-      model: process.env.AI_MODEL || "gpt-4o-mini",
+      model,
       input: [
         { role: "system", content: system },
         {
@@ -141,7 +142,7 @@ Devuelve SOLO este JSON (sin texto adicional):
     });
 
     const txt = response.output_text || "";
-    console.log("OpenAI raw output_text (first 200):", txt.slice(0, 200));
+    console.log(`[${reqId}] OpenAI output_text (first 300):`, short(txt, 300));
 
     let ia;
     try {
@@ -152,6 +153,7 @@ Devuelve SOLO este JSON (sin texto adicional):
         confidence: 0,
         suggested_status: "pendiente_revision",
         reasons: ["La IA no devolvió JSON válido."],
+        raw: short(txt, 400),
       };
     }
 
@@ -161,29 +163,46 @@ Devuelve SOLO este JSON (sin texto adicional):
     if (!Array.isArray(ia.reasons)) ia.reasons = [];
 
     ia.debug = {
+      reqId,
       ms: Date.now() - t0,
+      model,
       firebaseAdmin: fb,
     };
 
+    console.log(`[${reqId}] ✅ RESP OK in ${Date.now() - t0}ms`);
     return res.json(ia);
   } catch (e) {
-    console.error("ERROR /verify-consignacion:", e);
+    // ✅ Log completo en Render
+    const status = e?.status || e?.response?.status;
+    const msg = e?.message || String(e);
+    const data = e?.response?.data || e?.error?.response?.data;
+
+    console.error(`\n[ERR] /verify-consignacion FAIL`);
+    console.error("[ERR] status:", status);
+    console.error("[ERR] message:", msg);
+    if (data) console.error("[ERR] data:", data);
+
+    // ✅ Respuesta con detalles (debug). Luego lo apagamos.
     return res.status(500).json({
       ok: false,
       confidence: 0,
       suggested_status: "pendiente_revision",
       reasons: ["Error interno backend"],
-      error: String(e?.message || e),
+      debug_error: {
+        status: status ?? null,
+        message: msg,
+        data: data ?? null,
+      },
     });
   } finally {
-    console.log("---- /verify-consignacion END ---- ms:", Date.now() - t0);
+    console.log(`[DONE] /verify-consignacion ms=${Date.now() - t0}`);
   }
 });
 
 /* ======================================================
-   5) Start
+   Start
 ====================================================== */
-const port = Number(process.env.PORT || 3000);
+const port = Number(process.env.PORT || 10000);
 app.listen(port, () => {
   console.log("🚀 Server on port", port);
 });
