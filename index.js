@@ -23,6 +23,35 @@ function short(s, n = 160) {
   return s.length > n ? s.slice(0, n) + "..." : s;
 }
 
+/**
+ * ✅ Extrae JSON aunque venga envuelto en ```json ... ```
+ * - elimina fences
+ * - busca el primer bloque { ... }
+ * - intenta JSON.parse
+ */
+function extractJson(text) {
+  if (!text) return null;
+
+  const raw = String(text).trim();
+
+  // 1) quitar fences ```json ... ``` o ``` ... ```
+  const noFences = raw
+    .replace(/```json/gi, "```")
+    .replace(/```/g, "")
+    .trim();
+
+  // 2) tomar primer bloque { ... }
+  const match = noFences.match(/\{[\s\S]*\}/);
+  const candidate = match ? match[0].trim() : noFences;
+
+  // 3) parsear
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    return null;
+  }
+}
+
 /* =========================
    Health
 ========================= */
@@ -50,7 +79,9 @@ app.post("/verify-consignacion", async (req, res) => {
 
     console.log(`\n[${reqId}] HIT /verify-consignacion`);
     console.log(`[${reqId}] expectedAmount=${expectedAmount} expectedDate=${expectedDate}`);
-    console.log(`[${reqId}] imageMime=${imageMime} base64Len=${imageBase64 ? String(imageBase64).length : 0}`);
+    console.log(
+      `[${reqId}] imageMime=${imageMime} base64Len=${imageBase64 ? String(imageBase64).length : 0}`
+    );
 
     if (!imageBase64 || !imageMime || expectedAmount == null || !expectedDate) {
       return res.status(400).json({
@@ -71,13 +102,13 @@ app.post("/verify-consignacion", async (req, res) => {
     const system =
       "Eres un verificador de comprobantes de consignación en Colombia. " +
       "Extrae monto, fecha y banco/billetera. " +
-      "Compara con lo esperado y responde SOLO JSON válido.";
+      "Compara con lo esperado y responde SOLO JSON válido (sin ``` ni texto extra).";
 
     const user = `DATOS ESPERADOS:
 - expectedAmount: ${expectedAmount}
 - expectedDate (YYYY-MM-DD): ${expectedDate}
 
-Devuelve SOLO este JSON (sin texto adicional):
+Devuelve SOLO este JSON (sin texto adicional, sin markdown, sin \`\`\`):
 {
   "ok": boolean,
   "confidence": number,
@@ -93,7 +124,7 @@ Devuelve SOLO este JSON (sin texto adicional):
           role: "user",
           content: [
             { type: "input_text", text: user },
-            { type: "input_image", image_url: dataUrl }, // ✅ aquí ya no descarga nada
+            { type: "input_image", image_url: dataUrl },
           ],
         },
       ],
@@ -102,16 +133,17 @@ Devuelve SOLO este JSON (sin texto adicional):
     const out = response.output_text || "";
     console.log(`[${reqId}] OpenAI output_text:`, short(out, 300));
 
-    let ia;
-    try {
-      ia = JSON.parse(out);
-    } catch {
+    // ✅ Parse robusto (arregla el problema de ```json ... ```)
+    let ia = extractJson(out);
+
+    // fallback si aún no se pudo parsear
+    if (!ia || typeof ia !== "object") {
       ia = {
         ok: false,
         confidence: 0,
         suggested_status: "pendiente_revision",
         reasons: ["La IA no devolvió JSON válido."],
-        raw: short(out, 400),
+        raw: short(out, 800),
       };
     }
 
@@ -149,8 +181,5 @@ Devuelve SOLO este JSON (sin texto adicional):
   }
 });
 
-/* =========================
-   Start
-========================= */
 const port = Number(process.env.PORT || 10000);
 app.listen(port, () => console.log("🚀 Server on port", port));
