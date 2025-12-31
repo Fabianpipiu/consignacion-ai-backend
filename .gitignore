@@ -1,0 +1,12 @@
+# Dependencias
+node_modules/
+
+# Variables de entorno
+.env
+.env.*
+
+# Credenciales
+serviceAccount.json
+
+# Logs
+npm-debug.log*
