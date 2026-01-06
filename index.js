@@ -18,10 +18,7 @@ app.use(express.json({ limit: "20mb" })); // base64 pesa
 
 // =========================
 // Config “duro”
-/**
- * ✅ Destinos Nequi permitidos:
- * - puedes también meterlos en ENV: EXPECTED_TO_ACCOUNTS="313...,313..."
- */
+// =========================
 const DEFAULT_EXPECTED_TO_ACCOUNTS = (
   process.env.EXPECTED_TO_ACCOUNTS || "3138200803,3132294353"
 )
@@ -29,11 +26,17 @@ const DEFAULT_EXPECTED_TO_ACCOUNTS = (
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Umbrales (ajústalos si quieres)
-const TAMPER_HIGH = 0.65; // señales fuertes de posible edición
-const MIN_CONF_VERIFY = 0.70; // confianza final mínima para “verificado” (servidor)
-const REQUIRE_REFERENCE_FOR_VERIFY = true; // pide referencia para marcar verificado
-const REQUIRE_DESTINATION_FOR_VERIFY = true; // pide destino “Número Nequi” o QR match
+// 🔥 UMBRALES (más estrictos)
+const TAMPER_MODERATE = 0.38; // antes 0.35
+const TAMPER_HIGH = 0.55; // antes 0.65 (más sensible)
+const MIN_CONF_VERIFY = 0.82; // antes 0.70 (más exigente)
+
+// Reglas duras
+const REQUIRE_REFERENCE_FOR_VERIFY = true;
+const REQUIRE_DESTINATION_FOR_VERIFY = true;
+
+// ⚠️ Regla clave: si el comprobante trae QR pero NO se puede leer -> NO puede ser verificado
+const REQUIRE_QR_DECODE_FOR_VERIFY = true;
 
 // =========================
 // Helpers
@@ -73,7 +76,6 @@ function extractJson(text) {
   if (!text) return null;
 
   const raw = String(text).trim();
-
   const noFences = raw
     .replace(/```json/gi, "```")
     .replace(/```/g, "")
@@ -102,7 +104,6 @@ function normalizeDateYYYYMMDD(s) {
 function normalizeTimeHHMM(s) {
   const v = normalizeStr(s);
   if (!v) return null;
-  // acepta "19:47" o "07:47"
   if (/^\d{2}:\d{2}$/.test(v)) return v;
   return null;
 }
@@ -137,10 +138,7 @@ async function decodeQrFromDataUrl(dataUrl) {
 
     const buf = Buffer.from(parsed.b64, "base64");
 
-    // Jimp.read puede fallar si el buffer no es imagen válida
     const image = await Jimp.read(buf);
-
-    // qrcode-reader necesita bitmap
     const qr = new QrCode();
 
     const qrText = await new Promise((resolve, reject) => {
@@ -158,7 +156,6 @@ async function decodeQrFromDataUrl(dataUrl) {
 
     return { present: true, decoded: true, text: qrText, error: null };
   } catch (e) {
-    // si no detecta QR, puede lanzar error
     return { present: true, decoded: false, text: null, error: String(e?.message || e) };
   }
 }
@@ -167,6 +164,229 @@ function qrContainsAnyAccount(qrText, expectedAccounts) {
   const t = digitsOnly(qrText);
   if (!t) return false;
   return expectedAccounts.some((acc) => t.includes(digitsOnly(acc)));
+}
+
+// =========================
+// 🔥 Forense de imagen (ANTI-EDICIÓN)
+// - NO es perfecto, pero sube MUCHO la detección de ediciones pequeñas.
+// =========================
+async function readJimpFromDataUrl(dataUrl) {
+  const parsed = parseDataUrl(dataUrl);
+  if (!parsed) throw new Error("bad_dataurl");
+  const buf = Buffer.from(parsed.b64, "base64");
+  const img = await Jimp.read(buf);
+  return img;
+}
+
+function sampleGray(img, x, y) {
+  const rgba = Jimp.intToRGBA(img.getPixelColor(x, y));
+  // luminancia aproximada
+  return (rgba.r * 0.299 + rgba.g * 0.587 + rgba.b * 0.114) / 255;
+}
+
+// promedio de |diff|
+function meanAbsDiff(imgA, imgB, step = 2) {
+  const w = Math.min(imgA.bitmap.width, imgB.bitmap.width);
+  const h = Math.min(imgA.bitmap.height, imgB.bitmap.height);
+  let sum = 0;
+  let count = 0;
+
+  for (let y = 0; y < h; y += step) {
+    for (let x = 0; x < w; x += step) {
+      const a = sampleGray(imgA, x, y);
+      const b = sampleGray(imgB, x, y);
+      sum += Math.abs(a - b);
+      count++;
+    }
+  }
+  return count ? sum / count : 0;
+}
+
+// ELA-like: recomprime y compara
+async function elaScore(img) {
+  // ELA funciona mejor con JPEG. Aunque venga png, convertimos a jpeg para prueba.
+  const w = img.bitmap.width;
+  const h = img.bitmap.height;
+
+  // reducimos un poco para velocidad
+  const small = img.clone();
+  const maxSide = 1100;
+  if (Math.max(w, h) > maxSide) {
+    const scale = maxSide / Math.max(w, h);
+    small.resize(Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale)));
+  }
+
+  // recomprime
+  const recompressed = small.clone().quality(60); // calidad baja -> resalta inconsistencias
+  const buf = await recompressed.getBufferAsync(Jimp.MIME_JPEG);
+  const recompressed2 = await Jimp.read(buf);
+
+  const d = meanAbsDiff(small, recompressed2, 2); // 0..1 aprox pequeño
+  // normalización agresiva
+  // diff 0.02-0.05 ya puede ser sospechoso dependiendo
+  const score = clamp01((d - 0.012) / 0.06);
+  return { score, meanDiff: d };
+}
+
+// Macroblocking / compresión rara: mide diferencias por bloques 8x8
+function blockinessScore(img) {
+  const w = img.bitmap.width;
+  const h = img.bitmap.height;
+  const step = 8;
+
+  let sumEdges = 0;
+  let countEdges = 0;
+
+  // diferencias verticales en bordes de bloque
+  for (let y = 0; y < h; y += 2) {
+    for (let x = step; x < w; x += step) {
+      const a = sampleGray(img, x - 1, y);
+      const b = sampleGray(img, x, y);
+      sumEdges += Math.abs(a - b);
+      countEdges++;
+    }
+  }
+  // horizontales
+  for (let x = 0; x < w; x += 2) {
+    for (let y = step; y < h; y += step) {
+      const a = sampleGray(img, x, y - 1);
+      const b = sampleGray(img, x, y);
+      sumEdges += Math.abs(a - b);
+      countEdges++;
+    }
+  }
+
+  const mean = countEdges ? sumEdges / countEdges : 0;
+  // normalización (depende del ruido); calibrado para ser sensible
+  const score = clamp01((mean - 0.010) / 0.05);
+  return { score, mean };
+}
+
+// Bordes/halos: detecta exceso de bordes en región central (donde suelen editar texto)
+function edgeDensityScore(img) {
+  const w = img.bitmap.width;
+  const h = img.bitmap.height;
+
+  // región central (evitamos bordes UI)
+  const x0 = Math.round(w * 0.10);
+  const x1 = Math.round(w * 0.90);
+  const y0 = Math.round(h * 0.20);
+  const y1 = Math.round(h * 0.90);
+
+  let edges = 0;
+  let total = 0;
+
+  for (let y = y0 + 1; y < y1 - 1; y += 2) {
+    for (let x = x0 + 1; x < x1 - 1; x += 2) {
+      const c = sampleGray(img, x, y);
+      const gx = Math.abs(sampleGray(img, x + 1, y) - sampleGray(img, x - 1, y));
+      const gy = Math.abs(sampleGray(img, x, y + 1) - sampleGray(img, x, y - 1));
+      const g = gx + gy;
+      // umbral de borde
+      if (g > 0.20 && c > 0.05) edges++;
+      total++;
+    }
+  }
+
+  const density = total ? edges / total : 0; // 0..1
+  // mucha densidad de bordes en zona central puede ser texto pegado / nitidez rara
+  const score = clamp01((density - 0.055) / 0.10);
+  return { score, density };
+}
+
+// Parches lisos: detecta zona muy “plana” (blur/paste) en región donde están montos/fecha
+function smoothPatchScore(img) {
+  const w = img.bitmap.width;
+  const h = img.bitmap.height;
+
+  // zona típicamente de monto/fecha (parte baja / media)
+  const x0 = Math.round(w * 0.08);
+  const x1 = Math.round(w * 0.92);
+  const y0 = Math.round(h * 0.45);
+  const y1 = Math.round(h * 0.85);
+
+  let sumVar = 0;
+  let count = 0;
+
+  for (let y = y0 + 2; y < y1 - 2; y += 4) {
+    for (let x = x0 + 2; x < x1 - 2; x += 4) {
+      // var local simple: vecindario 3x3
+      let mean = 0;
+      let vcount = 0;
+      for (let yy = -1; yy <= 1; yy++) {
+        for (let xx = -1; xx <= 1; xx++) {
+          mean += sampleGray(img, x + xx, y + yy);
+          vcount++;
+        }
+      }
+      mean /= vcount;
+
+      let vari = 0;
+      for (let yy = -1; yy <= 1; yy++) {
+        for (let xx = -1; xx <= 1; xx++) {
+          const d = sampleGray(img, x + xx, y + yy) - mean;
+          vari += d * d;
+        }
+      }
+      vari /= vcount;
+      sumVar += vari;
+      count++;
+    }
+  }
+
+  const meanVar = count ? sumVar / count : 0;
+  // si var es MUY baja, la zona es sospechosamente lisa (borrón/pegue)
+  // convertimos a score: var baja => score alto
+  const score = clamp01((0.0035 - meanVar) / 0.0035);
+  return { score, meanVar };
+}
+
+async function forensicTamper(dataUrl) {
+  try {
+    const img = await readJimpFromDataUrl(dataUrl);
+
+    // clones en gris para que sea más estable
+    const gray = img.clone().greyscale();
+
+    const ela = await elaScore(gray);
+    const blk = blockinessScore(gray);
+    const edg = edgeDensityScore(gray);
+    const smt = smoothPatchScore(gray);
+
+    // fusión agresiva (más sensible)
+    // ELA pesa mucho, luego bloques y parches
+    const score = clamp01(
+      0.45 * ela.score +
+        0.22 * blk.score +
+        0.18 * smt.score +
+        0.15 * edg.score
+    );
+
+    const signals = [];
+    if (ela.score > 0.45) signals.push("ela_inconsistente");
+    if (blk.score > 0.45) signals.push("macroblocking_anomalo");
+    if (smt.score > 0.45) signals.push("zona_lisa_sospechosa");
+    if (edg.score > 0.55) signals.push("bordes_raros_texto_posible");
+
+    return {
+      ok: true,
+      score,
+      signals,
+      details: {
+        ela: { score: ela.score, meanDiff: ela.meanDiff },
+        blockiness: { score: blk.score, mean: blk.mean },
+        smooth: { score: smt.score, meanVar: smt.meanVar },
+        edges: { score: edg.score, density: edg.density },
+      },
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      score: 0,
+      signals: ["forensic_error"],
+      details: { error: String(e?.message || e) },
+    };
+  }
 }
 
 // =========================
@@ -215,7 +435,6 @@ function ensureVerifyResult(obj) {
     };
   }
 
-  // fields
   normFieldNumber("amount");
   normFieldString("date", { kind: "date" });
   normFieldString("time", { kind: "time" });
@@ -225,16 +444,14 @@ function ensureVerifyResult(obj) {
   normFieldString("statusLabel");
   normFieldBool("qrPresent");
 
-  // tamper
   out.tamper = out.tamper && typeof out.tamper === "object" ? out.tamper : {};
   out.tamper.suspected = typeof out.tamper.suspected === "boolean" ? out.tamper.suspected : false;
   out.tamper.score = clamp01(out.tamper.score);
   if (!Array.isArray(out.tamper.signals)) out.tamper.signals = [];
-  out.tamper.signals = out.tamper.signals.map((x) => normalizeStr(x)).filter(Boolean).slice(0, 8);
+  out.tamper.signals = out.tamper.signals.map((x) => normalizeStr(x)).filter(Boolean).slice(0, 12);
 
-  // notes
   if (!Array.isArray(out.notes)) out.notes = [];
-  out.notes = out.notes.map((x) => normalizeStr(x)).filter(Boolean).slice(0, 8);
+  out.notes = out.notes.map((x) => normalizeStr(x)).filter(Boolean).slice(0, 12);
 
   return out;
 }
@@ -245,6 +462,9 @@ function normalizeStatus(s) {
   return "pendiente_revision";
 }
 
+// =========================
+// Decisión final (más dura)
+// =========================
 function buildReasonsAndDecide({
   expectedAmount,
   expectedDate,
@@ -252,11 +472,12 @@ function buildReasonsAndDecide({
   expectedDateTime,
   iaExtract,
   qrInfo,
+  forensic,
 }) {
   const reasons = [];
 
   const ex = iaExtract?.extracted || {};
-  const tamper = iaExtract?.tamper || {};
+  const tamperAI = iaExtract?.tamper || {};
 
   const readAmount = ex?.amount?.value;
   const readDate = ex?.date?.value;
@@ -267,6 +488,7 @@ function buildReasonsAndDecide({
 
   const expAmt = toNumberMaybe(expectedAmount);
   const expDate = normalizeDateYYYYMMDD(expectedDate);
+
   const expectedAccs = Array.isArray(expectedToAccounts) && expectedToAccounts.length
     ? expectedToAccounts.map(digitsOnly).filter(Boolean)
     : DEFAULT_EXPECTED_TO_ACCOUNTS.map(digitsOnly).filter(Boolean);
@@ -289,25 +511,20 @@ function buildReasonsAndDecide({
     reasons.push("⚠️ No se pudo leer la fecha con claridad.");
   }
 
-  // ---------- hora (no siempre la controlas) ----------
-  if (readTime) {
-    reasons.push(`ℹ️ Hora leída: ${readTime}.`);
-  } else {
-    reasons.push("⚠️ No se pudo leer la hora (o no aparece).");
-  }
+  // ---------- hora ----------
+  if (readTime) reasons.push(`ℹ️ Hora leída: ${readTime}.`);
+  else reasons.push("⚠️ No se pudo leer la hora (o no aparece).");
 
   // ---------- referencia ----------
   const hasRef = !!(readRef && readRef.length >= 5);
   reasons.push(hasRef ? `✅ Referencia detectada: ${readRef}.` : "⚠️ No se detectó referencia (riesgo de edición).");
 
-  // ---------- estado (Envío Realizado) ----------
-  if (readStatus) {
-    reasons.push(`✅ Estado detectado: ${readStatus}.`);
-  } else {
-    reasons.push("⚠️ No se detectó el estado (Envío Realizado / etc.).");
-  }
+  // ---------- estado ----------
+  // (no lo usamos como regla dura porque varía, pero lo anotamos)
+  if (readStatus) reasons.push(`✅ Estado detectado: ${readStatus}.`);
+  else reasons.push("⚠️ No se detectó el estado (Envío Realizado / etc.).");
 
-  // ---------- destino (Número Nequi) ----------
+  // ---------- destino leído ----------
   let okDest = false;
   if (readToAcc) {
     okDest = expectedAccs.some((acc) => String(readToAcc).includes(acc) || acc.includes(String(readToAcc)));
@@ -317,79 +534,107 @@ function buildReasonsAndDecide({
   }
 
   // ---------- QR ----------
-  const qrReasons = [];
   let qrMismatch = false;
   let qrStrongOk = false;
 
   if (qrInfo?.present) {
     if (qrInfo.decoded) {
-      qrReasons.push("✅ QR presente y decodificado.");
+      reasons.push("✅ QR presente y decodificado.");
       const qrOk = qrContainsAnyAccount(qrInfo.text, expectedAccs);
       if (qrOk) {
         qrStrongOk = true;
-        qrReasons.push("✅ QR contiene un destino permitido.");
+        reasons.push("✅ QR contiene un destino permitido.");
       } else {
         qrMismatch = true;
-        qrReasons.push("❌ QR NO contiene ninguno de los destinos permitidos (posible comprobante ajeno/editado).");
+        reasons.push("❌ QR NO contiene destinos permitidos (posible comprobante ajeno/editado).");
       }
     } else {
-      qrReasons.push("⚠️ QR presente pero NO se pudo decodificar (imagen borrosa/recortada).");
+      reasons.push("⚠️ QR presente pero NO se pudo decodificar (recortado/borroso).");
     }
   } else {
-    qrReasons.push("⚠️ No se detectó QR en la imagen.");
+    reasons.push("⚠️ No se detectó QR en la imagen.");
   }
-  reasons.push(...qrReasons);
 
-  // ---------- tamper ----------
-  const tScore = clamp01(tamper?.score);
-  if (tScore >= TAMPER_HIGH) {
-    reasons.push("⚠️ Señales fuertes de posible edición en la imagen.");
-    if (Array.isArray(tamper?.signals) && tamper.signals.length) {
-      reasons.push(`ℹ️ Señales: ${tamper.signals.slice(0, 4).join(", ")}.`);
+  // ---------- tamper (IA + forense) ----------
+  const aiScore = clamp01(tamperAI?.score);
+  const forScore = clamp01(forensic?.score);
+
+  // combinación: si cualquiera sube, sube
+  const tScore = Math.max(aiScore, forScore);
+
+  if (forensic?.ok) {
+    if (forScore >= TAMPER_HIGH) {
+      reasons.push("⚠️ Forense: señales fuertes de edición (ELA/compresión/bordes).");
+      if (Array.isArray(forensic?.signals) && forensic.signals.length) {
+        reasons.push(`ℹ️ Forense señales: ${forensic.signals.slice(0, 4).join(", ")}.`);
+      }
+    } else if (forScore >= TAMPER_MODERATE) {
+      reasons.push("⚠️ Forense: señales moderadas de edición (revisión sugerida).");
+    } else {
+      reasons.push("✅ Forense: no se ven señales fuertes de edición.");
     }
-  } else if (tScore > 0.35) {
-    reasons.push("⚠️ Señales moderadas de posible edición (revisión sugerida).");
   } else {
-    reasons.push("✅ No se detectan señales fuertes de edición (aun así se validan reglas).");
+    reasons.push("⚠️ Forense no pudo analizar la imagen (se usa IA + reglas).");
+  }
+
+  if (aiScore >= TAMPER_HIGH) {
+    reasons.push("⚠️ IA: señales fuertes de posible edición.");
+    if (Array.isArray(tamperAI?.signals) && tamperAI.signals.length) {
+      reasons.push(`ℹ️ IA señales: ${tamperAI.signals.slice(0, 4).join(", ")}.`);
+    }
+  } else if (aiScore >= TAMPER_MODERATE) {
+    reasons.push("⚠️ IA: señales moderadas de posible edición.");
+  } else {
+    reasons.push("✅ IA: no ve señales fuertes de edición.");
   }
 
   // =========================
-  // Decisión final (reglas duras)
+  // Reglas duras (más estrictas)
   // =========================
-  // Rechazo inmediato si:
-  // - monto/fecha no coinciden
-  // - destino inválido (si se leyó) o QR mismatch
+
+  // 1) QR mismatch = rechazo inmediato
   if (qrMismatch) {
-    return { suggested_status: "rechazado", confidence: 0.85, reasons: reasons.slice(0, 12) };
+    return { suggested_status: "rechazado", confidence: 0.90, reasons: reasons.slice(0, 14), tamperFinal: tScore };
   }
 
+  // 2) si se leyó destino y es inválido => rechazo
   if (readToAcc && !okDest) {
-    return { suggested_status: "rechazado", confidence: 0.85, reasons: reasons.slice(0, 12) };
+    return { suggested_status: "rechazado", confidence: 0.90, reasons: reasons.slice(0, 14), tamperFinal: tScore };
   }
 
+  // 3) monto o fecha contradictorios => rechazo
   if (readAmount != null && expAmt != null && !okAmount) {
-    return { suggested_status: "rechazado", confidence: 0.85, reasons: reasons.slice(0, 12) };
+    return { suggested_status: "rechazado", confidence: 0.90, reasons: reasons.slice(0, 14), tamperFinal: tScore };
   }
-
   if (readDate && expDate && !okDate) {
-    return { suggested_status: "rechazado", confidence: 0.85, reasons: reasons.slice(0, 12) };
+    return { suggested_status: "rechazado", confidence: 0.90, reasons: reasons.slice(0, 14), tamperFinal: tScore };
   }
 
-  // Para verificar, pedimos “fuerte”:
+  // 4) Si hay QR presente pero NO decodifica => NO puede ser verificado (pendiente)
+  if (REQUIRE_QR_DECODE_FOR_VERIFY && qrInfo?.present && !qrInfo?.decoded) {
+    return { suggested_status: "pendiente_revision", confidence: 0.65, reasons: reasons.slice(0, 14), tamperFinal: tScore };
+  }
+
+  // 5) Para verificado pedimos:
   // - okAmount + okDate
-  // - destino válido (leído) O QR válido (decodificado y contiene destino)
+  // - destino fuerte: QR decodificado y contiene destino (ideal)  OR (destino leído y válido si REQUIRE_DESTINATION_FOR_VERIFY)
   // - referencia (si está habilitado)
-  // - tamper bajo
-  const destStrong = (okDest && !!readToAcc) || qrStrongOk;
+  // - tamper final bajo (estricto)
+  const destStrong = qrStrongOk || (REQUIRE_DESTINATION_FOR_VERIFY ? (okDest && !!readToAcc) : true);
   const refStrong = REQUIRE_REFERENCE_FOR_VERIFY ? hasRef : true;
 
-  if (okAmount && okDate && destStrong && refStrong && tScore < TAMPER_HIGH) {
-    const conf = Math.max(MIN_CONF_VERIFY, 0.80);
-    return { suggested_status: "verificado", confidence: conf, reasons: reasons.slice(0, 12) };
+  // tamper estricto: si supera moderado, NO verificamos
+  const tamperOkForVerify = tScore < TAMPER_MODERATE;
+
+  if (okAmount && okDate && destStrong && refStrong && tamperOkForVerify) {
+    const conf = Math.max(MIN_CONF_VERIFY, 0.86);
+    return { suggested_status: "verificado", confidence: conf, reasons: reasons.slice(0, 14), tamperFinal: tScore };
   }
 
-  // Si llegó aquí: no hay contradicción fuerte, pero falta info → pendiente
-  return { suggested_status: "pendiente_revision", confidence: 0.62, reasons: reasons.slice(0, 12) };
+  // si llegó aquí: no contradice fuerte, pero faltan condiciones fuertes => pendiente
+  // si tamper es alto => pendiente con confianza menor (no afirmamos)
+  const baseConf = tScore >= TAMPER_HIGH ? 0.58 : 0.66;
+  return { suggested_status: "pendiente_revision", confidence: baseConf, reasons: reasons.slice(0, 14), tamperFinal: tScore };
 }
 
 // =========================
@@ -417,16 +662,7 @@ app.get("/", (_, res) => {
 });
 
 // =========================================================
-// ✅ verify-consignacion (BASE64) — POTENTE
-// Flutter envía:
-// {
-//   imageBase64, imageMime,
-//   expectedAmount,
-//   expectedDate (YYYY-MM-DD),
-//   expectedDateTime (ISO, opcional),
-//   expectedToAccounts (opcional),
-//   imageUrl?
-// }
+// ✅ verify-consignacion (BASE64) — MÁS DURO + FORENSE
 // =========================================================
 app.post("/verify-consignacion", async (req, res) => {
   const t0 = Date.now();
@@ -471,48 +707,54 @@ app.post("/verify-consignacion", async (req, res) => {
     }
 
     // ======================
-    // 2) IA: extracción + tamper
+    // 2) Forense de imagen (anti-edición)
+    // ======================
+    const forensic = await forensicTamper(dataUrl);
+    console.log(`[${reqId}] Forensic: ok=${forensic.ok} score=${forensic.score.toFixed(3)} signals=${(forensic.signals || []).join(",")}`);
+
+    // ======================
+    // 3) IA: extracción + tamper
     // ======================
     const openai = getOpenAI();
     const model = process.env.AI_MODEL || "gpt-4o-mini";
     console.log(`[${reqId}] OpenAI model=${model}`);
 
+    const expectedAccs = Array.isArray(expectedToAccounts) && expectedToAccounts.length
+      ? expectedToAccounts
+      : DEFAULT_EXPECTED_TO_ACCOUNTS;
+
     const system =
-      "Eres un extractor y analista de comprobantes Nequi en Colombia. " +
+      "Eres un extractor y analista de comprobantes de pagos en Colombia (Nequi/Daviplata/Bancolombia/Wompi pueden aparecer). " +
       "NO debes decidir 'verificado' por intuición. " +
-      "Debes EXTRAER campos (monto, fecha, hora, referencia, destino, estado) " +
-      "y estimar señales de posible edición (tamper). " +
+      "Debes EXTRAER campos (monto, fecha, hora, referencia, destino, estado) y estimar señales de edición (tamper). " +
       "Responde SOLO JSON válido, sin markdown, sin ```.\n\n" +
       "REGLAS:\n" +
       "1) Devuelve SOLO el JSON solicitado.\n" +
       "2) confidence 0..1.\n" +
       "3) extracted.campo.confidence 0..1.\n" +
       "4) Si no puedes leer un campo: value=null y reason corto.\n" +
-      "5) tamper.score 0..1 (alto = posible edición).";
-
-    const expectedAccs = Array.isArray(expectedToAccounts) && expectedToAccounts.length
-      ? expectedToAccounts
-      : DEFAULT_EXPECTED_TO_ACCOUNTS;
+      "5) tamper.score 0..1 (alto = posible edición). " +
+      "6) Se MUY estricto: si ves texto pegado, bordes raros, tipografía diferente, pixeles de bloque o zonas borrosas parciales, sube tamper.\n";
 
     const user =
       `DATOS ESPERADOS:\n` +
       `- expectedAmount: ${expectedAmount}\n` +
       `- expectedDate (YYYY-MM-DD): ${expectedDate}\n` +
       `- expectedDateTime (ISO, opcional): ${expectedDateTime || ""}\n` +
-      `- expectedToAccounts (Número Nequi destino permitido): ${expectedAccs.join(", ")}\n\n` +
+      `- expectedToAccounts (destinos permitidos): ${expectedAccs.join(", ")}\n\n` +
       `EXTRAE del comprobante (si aparece):\n` +
       `- amount (COP)\n` +
       `- date (YYYY-MM-DD)\n` +
       `- time (HH:mm 24h si puedes)\n` +
       `- reference (ej M########)\n` +
       `- toName (Para ...)\n` +
-      `- toAccount (Número Nequi ... SOLO dígitos)\n` +
+      `- toAccount (Número destino SOLO dígitos)\n` +
       `- statusLabel (ej "Envío Realizado")\n` +
       `- qrPresent (true/false)\n\n` +
       `Y evalúa tamper:\n` +
       `- tamper.suspected (true/false)\n` +
       `- tamper.score (0..1)\n` +
-      `- tamper.signals (lista corta: "texto_con_bordes_raros", "zonas_borrosas", "inconsistencia_tipografia", "bloques_pixelados", etc)\n\n` +
+      `- tamper.signals (lista corta, específica)\n\n` +
       `Devuelve SOLO este JSON:\n` +
       `{\n` +
       `  "ok": boolean,\n` +
@@ -549,7 +791,6 @@ app.post("/verify-consignacion", async (req, res) => {
     console.log(`[${reqId}] OpenAI output_text:`, short(out, 320));
 
     let ia = extractJson(out);
-
     if (!ia || typeof ia !== "object") {
       ia = {
         ok: false,
@@ -560,11 +801,10 @@ app.post("/verify-consignacion", async (req, res) => {
         raw: short(out, 900),
       };
     }
-
     ia = ensureVerifyResult(ia);
 
     // ======================
-    // 3) Reglas duras (servidor decide)
+    // 4) Reglas duras (servidor decide)
     // ======================
     const decision = buildReasonsAndDecide({
       expectedAmount,
@@ -573,21 +813,37 @@ app.post("/verify-consignacion", async (req, res) => {
       expectedDateTime,
       iaExtract: ia,
       qrInfo,
+      forensic,
     });
+
+    // tamper final (IA vs forense)
+    const tamperFinal = clamp01(decision?.tamperFinal ?? Math.max(clamp01(ia?.tamper?.score), clamp01(forensic?.score)));
 
     const result = {
       ok: true,
       suggested_status: normalizeStatus(decision.suggested_status),
       confidence: clamp01(decision.confidence),
-      reasons: (decision.reasons || []).slice(0, 12),
+      reasons: (decision.reasons || []).slice(0, 14),
 
-      // ✅ extra info para auditoría
+      // ✅ auditoría
       extracted: ia.extracted,
-      tamper: ia.tamper,
+
+      tamper: {
+        ai: ia.tamper,
+        forensic: {
+          ok: forensic.ok,
+          score: clamp01(forensic.score),
+          signals: (forensic.signals || []).slice(0, 12),
+          details: forensic.details || null,
+        },
+        finalScore: tamperFinal,
+        finalLevel:
+          tamperFinal >= TAMPER_HIGH ? "high" : tamperFinal >= TAMPER_MODERATE ? "moderate" : "low",
+      },
+
       qr: {
         present: !!qrInfo?.present,
         decoded: !!qrInfo?.decoded,
-        // NO guardes el texto completo si no quieres; aquí lo mandamos corto para debug
         textShort: qrInfo?.decoded ? short(qrInfo.text, 220) : null,
         error: qrInfo?.decoded ? null : (qrInfo?.error || null),
       },
@@ -595,7 +851,7 @@ app.post("/verify-consignacion", async (req, res) => {
       debug: { reqId, ms: Date.now() - t0, model },
     };
 
-    console.log(`[${reqId}] ✅ DONE ${result.suggested_status} in ${Date.now() - t0}ms`);
+    console.log(`[${reqId}] ✅ DONE ${result.suggested_status} in ${Date.now() - t0}ms tamperFinal=${result.tamper.finalScore.toFixed(3)}`);
     return res.json(result);
   } catch (e) {
     const status = e?.status || e?.response?.status;
