@@ -3,6 +3,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
+import fetch from "node-fetch"; // ✅ AGREGAR ESTO
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
@@ -68,6 +69,21 @@ function clamp01(n) {
 function asDataUrl(imageMime, imageBase64) {
   return `data:${imageMime};base64,${imageBase64}`;
 }
+
+// ✅ Si el cliente/servidor manda imageUrl (Storage), la convertimos a base64 aquí
+async function fetchImageAsBase64(imageUrl) {
+  const r = await fetch(imageUrl);
+  if (!r.ok) throw new Error(`No se pudo descargar imagen: ${r.status}`);
+
+  const mimeRaw = r.headers.get("content-type") || "image/jpeg";
+  const imageMime = mimeRaw.split(";")[0].trim();
+
+  const ab = await r.arrayBuffer();
+  const imageBase64 = Buffer.from(ab).toString("base64");
+
+  return { imageBase64, imageMime };
+}
+
 
 /**
  * ✅ Extrae JSON aunque venga envuelto en ```json ... ```
@@ -668,31 +684,34 @@ app.post("/verify-consignacion", async (req, res) => {
   const t0 = Date.now();
   const reqId = req._reqId || Math.random().toString(16).slice(2, 10);
 
-  try {
-    const {
-      imageBase64,
-      imageMime,
-      expectedAmount,
-      expectedDate,
-      expectedDateTime,
-      expectedToAccounts,
-    } = req.body || {};
+    try {
+    let {
+    imageBase64,
+    imageMime,
+    imageUrl, // ✅ NUEVO
+    expectedAmount,
+    expectedDate,
+    expectedDateTime,
+    expectedToAccounts,
+  } = req.body || {};
 
-    console.log(`[${reqId}] HIT /verify-consignacion`);
-    console.log(`[${reqId}] expectedAmount=${expectedAmount} expectedDate=${expectedDate} expectedDateTime=${expectedDateTime}`);
-    console.log(`[${reqId}] expectedToAccounts=${Array.isArray(expectedToAccounts) ? expectedToAccounts.join(",") : "(none)"}`);
-    console.log(
-      `[${reqId}] imageMime=${imageMime} base64Len=${imageBase64 ? String(imageBase64).length : 0}`
-    );
+  // ✅ Si no viene base64/mime pero sí imageUrl -> descargar y convertir
+  if ((!imageBase64 || !imageMime) && imageUrl) {
+    const got = await fetchImageAsBase64(imageUrl);
+    imageBase64 = got.imageBase64;
+    imageMime = got.imageMime;
+  }
 
-    if (!imageBase64 || !imageMime || expectedAmount == null || !expectedDate) {
-      return res.status(400).json({
-        ok: false,
-        confidence: 0,
-        suggested_status: "pendiente_revision",
-        reasons: ["Faltan imageBase64, imageMime, expectedAmount o expectedDate"],
-      });
-    }
+
+    if ((!imageBase64 || !imageMime) || expectedAmount == null || !expectedDate) {
+  return res.status(400).json({
+    ok: false,
+    confidence: 0,
+    suggested_status: "pendiente_revision",
+    reasons: ["Faltan imageBase64+imageMime (o imageUrl), expectedAmount o expectedDate"],
+  });
+}
+
 
     const dataUrl = asDataUrl(imageMime, imageBase64);
 
