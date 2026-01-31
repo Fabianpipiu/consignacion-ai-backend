@@ -12,6 +12,7 @@
     "express": "^4.19.2",
     "firebase-admin": "^12.5.0",
     "jimp": "^1.6.0",
+    "jsqr": "^1.4.0",
     "openai": "^4.62.0",
     "qrcode-reader": "^1.0.4"
   }
