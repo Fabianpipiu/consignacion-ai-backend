@@ -4,18 +4,7 @@ import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
 import fetch from "node-fetch";
-import { createRequire } from "module";
-
-const require = createRequire(import.meta.url);
-
-// =========================
-// Deps
-// =========================
-// QR (mejorado): jsQR + Jimp (qrcode-reader queda de fallback)
-// npm i jimp jsqr qrcode-reader
-const Jimp = require("jimp");
-const jsQR = require("jsqr");
-const QrCode = require("qrcode-reader");
+import crypto from "crypto";
 
 // =========================
 // App
@@ -35,24 +24,26 @@ const DEFAULT_EXPECTED_TO_ACCOUNTS = (
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Umbrales tamper (ya NO bloquean “verificado” tan fácil)
-const TAMPER_MODERATE = 0.45;
-const TAMPER_HIGH = 0.65;
-
 // Para “verificado”
 const MIN_CONF_VERIFY = 0.80;
-
-// Reglas (más razonables para miles de bancos y físicos)
-const REQUIRE_REFERENCE_FOR_VERIFY = false;     // antes true (muy duro para bancos distintos)
-const REQUIRE_DESTINATION_FOR_VERIFY = false;   // antes true (muchos comprobantes no traen destino legible)
-const REQUIRE_QR_DECODE_FOR_VERIFY = false;     // antes true (si nunca decodifica, no sirve)
 
 // Montos: ustedes mandan 45 => 45.000 / 134 => 134.000
 const EXPECTED_AMOUNT_IS_THOUSANDS = true;
 
 // Tolerancia monto (COP)
 const AMOUNT_MIN_TOLERANCE_COP = 1000; // mínimo 1.000 de tolerancia
-const AMOUNT_PCT_TOLERANCE = 0.012;    // 1.2%
+const AMOUNT_PCT_TOLERANCE = 0.012; // 1.2%
+
+// Validación “fuerte” por confianza IA (si no llega, no se verifica)
+const MIN_FIELD_CONF_AMOUNT = 0.60;
+const MIN_FIELD_CONF_DATE = 0.60;
+
+// Si mandas expectedDateTime, validamos la hora si se pudo leer (no bloquea si no hay hora)
+const MAX_TIME_DIFF_MINUTES = 240; // 4h
+
+// Validación imagen
+const ALLOWED_MIMES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8MB
 
 // =========================
 // Helpers base
@@ -74,13 +65,16 @@ function short(s, n = 220) {
 function normalizeStr(x) {
   return (x == null ? "" : String(x)).trim();
 }
+
 function digitsOnly(x) {
   return normalizeStr(x).replace(/[^\d]/g, "");
 }
+
 function clamp01(n) {
   if (typeof n !== "number" || Number.isNaN(n)) return 0;
   return Math.max(0, Math.min(1, n));
 }
+
 function asDataUrl(imageMime, imageBase64) {
   return `data:${imageMime};base64,${imageBase64}`;
 }
@@ -93,7 +87,8 @@ async function fetchImageAsBase64(imageUrl) {
   const imageMime = mimeRaw.split(";")[0].trim();
 
   const ab = await r.arrayBuffer();
-  const imageBase64 = Buffer.from(ab).toString("base64");
+  const buf = Buffer.from(ab);
+  const imageBase64 = buf.toString("base64");
 
   return { imageBase64, imageMime };
 }
@@ -102,10 +97,7 @@ function extractJson(text) {
   if (!text) return null;
 
   const raw = String(text).trim();
-  const noFences = raw
-    .replace(/```json/gi, "```")
-    .replace(/```/g, "")
-    .trim();
+  const noFences = raw.replace(/```json/gi, "```").replace(/```/g, "").trim();
 
   const match = noFences.match(/\{[\s\S]*\}/);
   const candidate = match ? match[0].trim() : noFences;
@@ -117,6 +109,45 @@ function extractJson(text) {
   }
 }
 
+function sha256Hex(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+function detectMimeFromMagic(buf) {
+  if (!buf || buf.length < 16) return null;
+
+  // JPEG: FF D8 FF
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (
+    buf[0] === 0x89 &&
+    buf[1] === 0x50 &&
+    buf[2] === 0x4e &&
+    buf[3] === 0x47 &&
+    buf[4] === 0x0d &&
+    buf[5] === 0x0a &&
+    buf[6] === 0x1a &&
+    buf[7] === 0x0a
+  )
+    return "image/png";
+
+  // WEBP: "RIFF" .... "WEBP"
+  if (
+    buf[0] === 0x52 &&
+    buf[1] === 0x49 &&
+    buf[2] === 0x46 &&
+    buf[3] === 0x46 &&
+    buf[8] === 0x57 &&
+    buf[9] === 0x45 &&
+    buf[10] === 0x42 &&
+    buf[11] === 0x50
+  )
+    return "image/webp";
+
+  return null;
+}
+
 // =========================
 // Date helpers (más robusto)
 // =========================
@@ -124,12 +155,11 @@ function isIsoDateYYYYMMDD(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 }
 
-// Convierte dd/mm/yyyy o dd-mm-yyyy a yyyy-mm-dd
+// dd/mm/yyyy o dd-mm-yyyy -> yyyy-mm-dd
 function tryParseLatamDate(s) {
   const v = normalizeStr(s);
   if (!v) return null;
 
-  // dd/mm/yyyy o dd-mm-yyyy
   const m = v.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
   if (!m) return null;
 
@@ -154,33 +184,57 @@ function normalizeTimeHHMM(s) {
   const v = normalizeStr(s);
   if (!v) return null;
 
-  // HH:mm
   if (/^\d{2}:\d{2}$/.test(v)) return v;
-
-  // H:mm
   if (/^\d{1}:\d{2}$/.test(v)) return `0${v}`;
 
   return null;
 }
 
 function approxSameDate(a, b) {
-  return normalizeDateYYYYMMDD(a) && normalizeDateYYYYMMDD(b) && normalizeDateYYYYMMDD(a) === normalizeDateYYYYMMDD(b);
+  const na = normalizeDateYYYYMMDD(a);
+  const nb = normalizeDateYYYYMMDD(b);
+  return !!(na && nb && na === nb);
+}
+
+function parseExpectedDateTime(expectedDateTime) {
+  // soporta:
+  // - "YYYY-MM-DD HH:mm"
+  // - "YYYY-MM-DDTHH:mm"
+  // - "YYYY-MM-DDTHH:mm:ss"
+  // - "YYYY-MM-DD"
+  const s = normalizeStr(expectedDateTime);
+  if (!s) return null;
+
+  const m1 = s.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/);
+  if (m1) return { date: m1[1], time: m1[2] };
+
+  const d = normalizeDateYYYYMMDD(s);
+  if (d) return { date: d, time: null };
+
+  return null;
+}
+
+function minutesDiffHHMM(a, b) {
+  const ta = normalizeTimeHHMM(a);
+  const tb = normalizeTimeHHMM(b);
+  if (!ta || !tb) return null;
+  const [ah, am] = ta.split(":").map((x) => Number(x));
+  const [bh, bm] = tb.split(":").map((x) => Number(x));
+  if ([ah, am, bh, bm].some((n) => Number.isNaN(n))) return null;
+  return Math.abs((ah * 60 + am) - (bh * 60 + bm));
 }
 
 // =========================
-// Money helpers (mejorado)
+// Money helpers
 // =========================
 function toNumberMaybe(x) {
   if (x == null) return null;
   if (typeof x === "number" && !Number.isNaN(x)) return x;
 
   const s = String(x);
-
-  // intenta detectar decimales (poco común en COP, pero por si)
   const cleaned = s.replace(/[^\d.,]/g, "");
   if (!cleaned) return null;
 
-  // si viene como "45.000" o "45,000" o "45 000"
   const digits = cleaned.replace(/[^\d]/g, "");
   if (!digits) return null;
 
@@ -188,24 +242,28 @@ function toNumberMaybe(x) {
   return Number.isNaN(n) ? null : n;
 }
 
-// Normaliza expectedAmount según tu regla: 45 => 45000
 function normalizeExpectedAmountCOP(expectedAmount) {
   const n = toNumberMaybe(expectedAmount);
   if (n == null) return null;
 
-  // si ustedes mandan 45/134 para representar miles
   if (EXPECTED_AMOUNT_IS_THOUSANDS && n > 0 && n < 1000) return n * 1000;
-
   return n;
 }
 
-// Compara monto leído vs esperado con escalas por si IA leyó “45” en vez de “45000”
 function compareAmountsCOP(readAmountRaw, expectedAmountRaw) {
   const exp = normalizeExpectedAmountCOP(expectedAmountRaw);
   const read = toNumberMaybe(readAmountRaw);
 
   if (exp == null || read == null) {
-    return { ok: false, exp: exp ?? null, read: read ?? null, bestRead: null, bestScale: null, diff: null, tol: null };
+    return {
+      ok: false,
+      exp: exp ?? null,
+      read: read ?? null,
+      bestRead: null,
+      bestScale: null,
+      diff: null,
+      tol: null,
+    };
   }
 
   const scales = [1, 10, 100, 1000];
@@ -214,242 +272,29 @@ function compareAmountsCOP(readAmountRaw, expectedAmountRaw) {
   for (const sc of scales) {
     const candidate = read * sc;
 
-    const tol = Math.max(AMOUNT_MIN_TOLERANCE_COP, Math.round(exp * AMOUNT_PCT_TOLERANCE));
+    const tol = Math.max(
+      AMOUNT_MIN_TOLERANCE_COP,
+      Math.round(exp * AMOUNT_PCT_TOLERANCE)
+    );
     const diff = Math.abs(candidate - exp);
-
     const ok = diff <= tol;
 
-    // score: prefer exact-ish, prefer smaller scale when tie
-    const score = diff + (sc > 1 ? 0.5 : 0); // pequeñísima penalización por escalar
+    const score = diff + (sc > 1 ? 0.5 : 0);
 
     if (!best || score < best.score) {
       best = { ok, exp, read, bestRead: candidate, bestScale: sc, diff, tol, score };
     }
   }
 
-  // Caso: esperado es 45000 y leído 45000 (sc=1) => ok
-  // Caso: esperado 45000 y leído 45 (sc=1000) => ok
-  return { ok: best.ok, exp: best.exp, read: best.read, bestRead: best.bestRead, bestScale: best.bestScale, diff: best.diff, tol: best.tol };
-}
-
-// =========================
-// DataURL parse
-// =========================
-function parseDataUrl(dataUrl) {
-  const m = String(dataUrl || "").match(/^data:([^;]+);base64,(.+)$/);
-  if (!m) return null;
-  return { mime: m[1], b64: m[2] };
-}
-
-async function readJimpFromDataUrl(dataUrl) {
-  const parsed = parseDataUrl(dataUrl);
-  if (!parsed) throw new Error("bad_dataurl");
-  const buf = Buffer.from(parsed.b64, "base64");
-  return await Jimp.read(buf);
-}
-
-// =========================
-// QR decode (MUCHO mejorado)
-// - Intenta varias pre-procesos y rotaciones
-// - Usa jsQR (mejor en imágenes reales) y fallback qrcode-reader
-// =========================
-function jimpToRGBAUint8(img) {
-  // Jimp bitmap.data ya es un Buffer RGBA (Uint8)
-  // jsQR espera Uint8ClampedArray
-  const { data, width, height } = img.bitmap;
-  const clamped = new Uint8ClampedArray(data);
-  return { data: clamped, width, height };
-}
-
-function makeQrVariants(img) {
-  const variants = [];
-
-  // base
-  variants.push(img.clone());
-
-  // grayscale + normalize
-  variants.push(img.clone().greyscale().normalize());
-
-  // grayscale + high contrast
-  variants.push(img.clone().greyscale().contrast(0.6).normalize());
-
-  // invert (a veces QR impreso raro)
-  variants.push(img.clone().greyscale().contrast(0.6).normalize().invert());
-
-  // resize up (si viene pequeño)
-  const w = img.bitmap.width;
-  const h = img.bitmap.height;
-  if (Math.max(w, h) < 900) {
-    variants.push(img.clone().resize(w * 2, h * 2).greyscale().normalize().contrast(0.5));
-  }
-
-  // sharpen leve (ayuda a bordes)
-  variants.push(img.clone().greyscale().normalize().contrast(0.5).convolute([
-    [0, -1, 0],
-    [-1, 5, -1],
-    [0, -1, 0],
-  ]));
-
-  return variants;
-}
-
-function rotateVariants(img) {
-  const out = [img];
-  out.push(img.clone().rotate(90, false));
-  out.push(img.clone().rotate(180, false));
-  out.push(img.clone().rotate(270, false));
-  return out;
-}
-
-async function decodeQrWithJsQR(img) {
-  const { data, width, height } = jimpToRGBAUint8(img);
-  const code = jsQR(data, width, height, { inversionAttempts: "attemptBoth" });
-  return code?.data ? String(code.data) : null;
-}
-
-async function decodeQrWithQrcodeReader(img) {
-  const qr = new QrCode();
-  const qrText = await new Promise((resolve) => {
-    qr.callback = (_err, value) => {
-      const text = value?.result ? String(value.result) : null;
-      resolve(text);
-    };
-    qr.decode(img.bitmap);
-  });
-  return qrText ? String(qrText) : null;
-}
-
-async function decodeQrFromDataUrl(dataUrl) {
-  try {
-    const img0 = await readJimpFromDataUrl(dataUrl);
-
-    // intentamos recortes típicos (QR suele estar en parte baja o esquinas)
-    const crops = [];
-    const w = img0.bitmap.width;
-    const h = img0.bitmap.height;
-
-    crops.push(img0.clone()); // full
-
-    // bottom half
-    crops.push(img0.clone().crop(0, Math.floor(h * 0.45), w, Math.floor(h * 0.55)));
-
-    // bottom-right quadrant
-    crops.push(img0.clone().crop(Math.floor(w * 0.45), Math.floor(h * 0.45), Math.floor(w * 0.55), Math.floor(h * 0.55)));
-
-    // bottom-left quadrant
-    crops.push(img0.clone().crop(0, Math.floor(h * 0.45), Math.floor(w * 0.55), Math.floor(h * 0.55)));
-
-    // intenta con variantes
-    for (const crop of crops) {
-      const variants = makeQrVariants(crop);
-
-      for (const v of variants) {
-        // a veces conviene limitar tamaño (jsQR no ama imágenes gigantes)
-        const vv = v.clone();
-        const maxSide = 1400;
-        if (Math.max(vv.bitmap.width, vv.bitmap.height) > maxSide) {
-          const scale = maxSide / Math.max(vv.bitmap.width, vv.bitmap.height);
-          vv.resize(
-            Math.max(1, Math.round(vv.bitmap.width * scale)),
-            Math.max(1, Math.round(vv.bitmap.height * scale))
-          );
-        }
-
-        const rots = rotateVariants(vv);
-        for (const r of rots) {
-          // 1) jsQR
-          const js = await decodeQrWithJsQR(r);
-          if (js) {
-            return { present: true, decoded: true, text: js, error: null, method: "jsqr" };
-          }
-
-          // 2) fallback qrcode-reader
-          const qrr = await decodeQrWithQrcodeReader(r);
-          if (qrr) {
-            return { present: true, decoded: true, text: qrr, error: null, method: "qrcode-reader" };
-          }
-        }
-      }
-    }
-
-    // No decodificó. “present” no lo podemos asegurar sin detector real.
-    return { present: false, decoded: false, text: null, error: "no_qr_decoded", method: null };
-  } catch (e) {
-    return { present: false, decoded: false, text: null, error: String(e?.message || e), method: null };
-  }
-}
-
-function qrContainsAnyAccount(qrText, expectedAccounts) {
-  const t = digitsOnly(qrText);
-  if (!t) return false;
-  return expectedAccounts.some((acc) => t.includes(digitsOnly(acc)));
-}
-
-// =========================
-// Forense (lo dejamos SOLO informativo, no bloquea)
-// =========================
-function sampleGray(img, x, y) {
-  const rgba = Jimp.intToRGBA(img.getPixelColor(x, y));
-  return (rgba.r * 0.299 + rgba.g * 0.587 + rgba.b * 0.114) / 255;
-}
-
-function meanAbsDiff(imgA, imgB, step = 2) {
-  const w = Math.min(imgA.bitmap.width, imgB.bitmap.width);
-  const h = Math.min(imgA.bitmap.height, imgB.bitmap.height);
-  let sum = 0;
-  let count = 0;
-
-  for (let y = 0; y < h; y += step) {
-    for (let x = 0; x < w; x += step) {
-      const a = sampleGray(imgA, x, y);
-      const b = sampleGray(imgB, x, y);
-      sum += Math.abs(a - b);
-      count++;
-    }
-  }
-  return count ? sum / count : 0;
-}
-
-async function elaScore(img) {
-  const w = img.bitmap.width;
-  const h = img.bitmap.height;
-
-  const small = img.clone();
-  const maxSide = 1100;
-  if (Math.max(w, h) > maxSide) {
-    const scale = maxSide / Math.max(w, h);
-    small.resize(Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale)));
-  }
-
-  const recompressed = small.clone().quality(60);
-  const buf = await recompressed.getBufferAsync(Jimp.MIME_JPEG);
-  const recompressed2 = await Jimp.read(buf);
-
-  const d = meanAbsDiff(small, recompressed2, 2);
-
-  // normalización menos “agresiva”
-  const score = clamp01((d - 0.010) / 0.08);
-  return { score, meanDiff: d };
-}
-
-async function forensicTamper(dataUrl) {
-  try {
-    const img = await readJimpFromDataUrl(dataUrl);
-    const gray = img.clone().greyscale();
-
-    const ela = await elaScore(gray);
-
-    // Forense simplificado (en producción suele fallar mucho con screenshots/compress)
-    // Lo dejamos como señal suave.
-    const score = clamp01(ela.score);
-
-    const signals = [];
-    if (score > 0.65) signals.push("ela_inconsistente");
-
-    return { ok: true, score, signals, details: { ela } };
-  } catch (e) {
-    return { ok: false, score: 0, signals: ["forensic_error"], details: { error: String(e?.message || e) } };
-  }
+  return {
+    ok: best.ok,
+    exp: best.exp,
+    read: best.read,
+    bestRead: best.bestRead,
+    bestScale: best.bestScale,
+    diff: best.diff,
+    tol: best.tol,
+  };
 }
 
 // =========================
@@ -473,6 +318,7 @@ function ensureVerifyResult(obj) {
       reason: normalizeStr(f.reason),
     };
   }
+
   function normFieldString(fieldName, opts = {}) {
     const f = ex[fieldName] && typeof ex[fieldName] === "object" ? ex[fieldName] : {};
     let value = normalizeStr(f.value);
@@ -488,16 +334,8 @@ function ensureVerifyResult(obj) {
       reason: normalizeStr(f.reason),
     };
   }
-  function normFieldBool(fieldName) {
-    const f = ex[fieldName] && typeof ex[fieldName] === "object" ? ex[fieldName] : {};
-    const value = typeof f.value === "boolean" ? f.value : null;
-    ex[fieldName] = {
-      value,
-      confidence: clamp01(f.confidence),
-      reason: normalizeStr(f.reason),
-    };
-  }
 
+  // Campos principales
   normFieldNumber("amount");
   normFieldString("date", { kind: "date" });
   normFieldString("time", { kind: "time" });
@@ -505,13 +343,16 @@ function ensureVerifyResult(obj) {
   normFieldString("toName");
   normFieldString("toAccount", { kind: "digits" });
   normFieldString("statusLabel");
-  normFieldBool("qrPresent");
+  normFieldString("channel"); // Bancolombia/Nequi/PSE/Wompi/etc
+  normFieldString("transactionId"); // id/autorización si existe
+  normFieldString("fromAccount", { kind: "digits" }); // si aparece (tel/cuenta)
 
-  out.tamper = out.tamper && typeof out.tamper === "object" ? out.tamper : {};
-  out.tamper.suspected = typeof out.tamper.suspected === "boolean" ? out.tamper.suspected : false;
-  out.tamper.score = clamp01(out.tamper.score);
-  if (!Array.isArray(out.tamper.signals)) out.tamper.signals = [];
-  out.tamper.signals = out.tamper.signals.map((x) => normalizeStr(x)).filter(Boolean).slice(0, 12);
+  // Señales “suaves” (no forense, no QR): solo lo que la IA observe del contenido
+  out.integrity = out.integrity && typeof out.integrity === "object" ? out.integrity : {};
+  out.integrity.suspected = typeof out.integrity.suspected === "boolean" ? out.integrity.suspected : false;
+  out.integrity.score = clamp01(out.integrity.score);
+  if (!Array.isArray(out.integrity.signals)) out.integrity.signals = [];
+  out.integrity.signals = out.integrity.signals.map((x) => normalizeStr(x)).filter(Boolean).slice(0, 12);
 
   if (!Array.isArray(out.notes)) out.notes = [];
   out.notes = out.notes.map((x) => normalizeStr(x)).filter(Boolean).slice(0, 12);
@@ -525,8 +366,15 @@ function normalizeStatus(s) {
   return "pendiente_revision";
 }
 
+function labelLooksSuccessful(label) {
+  const s = normalizeStr(label).toLowerCase();
+  if (!s) return false;
+  // palabras típicas de “ok”
+  return /(aprob|exitos|exitosa|complet|confirm|realizad|pagad|recibid|procesad|ok)/i.test(s);
+}
+
 // =========================
-// Decisión final (más razonable)
+// Decisión final (sin QR, sin forense)
 // =========================
 function buildReasonsAndDecide({
   expectedAmount,
@@ -534,20 +382,26 @@ function buildReasonsAndDecide({
   expectedToAccounts,
   expectedDateTime,
   iaExtract,
-  qrInfo,
-  forensic,
 }) {
   const reasons = [];
-
   const ex = iaExtract?.extracted || {};
-  const tamperAI = iaExtract?.tamper || {};
+  const integrity = iaExtract?.integrity || {};
 
   const readAmount = ex?.amount?.value;
+  const readAmountConf = clamp01(ex?.amount?.confidence);
+
   const readDate = ex?.date?.value;
+  const readDateConf = clamp01(ex?.date?.confidence);
+
   const readTime = ex?.time?.value;
+  const readTimeConf = clamp01(ex?.time?.confidence);
+
   const readRef = ex?.reference?.value ? String(ex.reference.value) : null;
   const readToAcc = ex?.toAccount?.value ? String(ex.toAccount.value) : null;
   const readStatus = ex?.statusLabel?.value ? String(ex.statusLabel.value) : null;
+
+  const readChannel = ex?.channel?.value ? String(ex.channel.value) : null;
+  const readTxnId = ex?.transactionId?.value ? String(ex.transactionId.value) : null;
 
   const expAmt = normalizeExpectedAmountCOP(expectedAmount);
   const expDate = normalizeDateYYYYMMDD(expectedDate);
@@ -559,23 +413,24 @@ function buildReasonsAndDecide({
 
   const checkDestinations = Array.isArray(expectedToAccounts) && expectedToAccounts.length > 0;
 
-  // ---------- monto (con escalas) ----------
-  let okAmount = false;
+  // ---------- validación amount ----------
   const amountCmp = compareAmountsCOP(readAmount, expectedAmount);
+  const scaleNote = amountCmp.bestScale && amountCmp.bestScale !== 1 ? ` (escala x${amountCmp.bestScale})` : "";
 
+  let okAmount = false;
   if (amountCmp.exp != null && amountCmp.read != null) {
     okAmount = amountCmp.ok;
-    const scaleNote = amountCmp.bestScale && amountCmp.bestScale !== 1 ? ` (escala x${amountCmp.bestScale})` : "";
-    reasons.push(
-      okAmount
-        ? `✅ Monto coincide: esperado ${amountCmp.exp}, leído ${amountCmp.bestRead}${scaleNote}.`
-        : `❌ Monto NO coincide. Esperado ${amountCmp.exp}, leído ${amountCmp.bestRead}${scaleNote} (diff ${amountCmp.diff}, tol ${amountCmp.tol}).`
-    );
+    if (okAmount) {
+      reasons.push(`✅ Monto coincide: esperado ${amountCmp.exp}, leído ${amountCmp.bestRead}${scaleNote}.`);
+    } else {
+      // ✅ pedido: QUITAMOS diff/tol del texto
+      reasons.push(`❌ Monto NO coincide. Esperado ${amountCmp.exp}, leído ${amountCmp.bestRead}${scaleNote}.`);
+    }
   } else {
     reasons.push("⚠️ No se pudo leer el monto con claridad.");
   }
 
-  // ---------- fecha ----------
+  // ---------- validación date ----------
   let okDate = false;
   if (readDate && expDate) {
     okDate = approxSameDate(String(readDate), expDate);
@@ -584,20 +439,33 @@ function buildReasonsAndDecide({
     reasons.push("⚠️ No se pudo leer la fecha con claridad.");
   }
 
-  // ---------- hora (informativo) ----------
-  if (readTime) reasons.push(`ℹ️ Hora leída: ${readTime}.`);
-  else reasons.push("ℹ️ Hora no detectada (ok en muchos comprobantes).");
+  // ---------- validación expectedDateTime (si aplica) ----------
+  const expDT = parseExpectedDateTime(expectedDateTime);
+  if (expDT?.date) {
+    // si date esperado tiene, y readDate existe, ya lo validamos arriba.
+    if (expDT.time && readTime) {
+      const md = minutesDiffHHMM(expDT.time, readTime);
+      if (md == null) {
+        reasons.push("ℹ️ Hora detectada pero no se pudo comparar.");
+      } else if (md <= MAX_TIME_DIFF_MINUTES) {
+        reasons.push(`✅ Hora razonable vs expectedDateTime (±${MAX_TIME_DIFF_MINUTES / 60}h).`);
+      } else {
+        reasons.push(`⚠️ Hora fuera de rango vs expectedDateTime (diferencia ~${md} min).`);
+      }
+    } else if (expDT.time && !readTime) {
+      reasons.push("ℹ️ expectedDateTime trae hora, pero el comprobante no mostró hora legible (no bloquea).");
+    }
+  }
 
-  // ---------- referencia (ya NO dura) ----------
-  const hasRef = !!(readRef && readRef.length >= 5);
-  if (hasRef) reasons.push(`✅ Referencia detectada: ${readRef}.`);
-  else reasons.push("ℹ️ Referencia no detectada (ok en algunos bancos/formatos).");
+  // ---------- confianza mínima (extra verificación) ----------
+  if (readAmount != null && readAmountConf < MIN_FIELD_CONF_AMOUNT) {
+    reasons.push(`⚠️ Monto leído con baja confianza (${readAmountConf.toFixed(2)}).`);
+  }
+  if (readDate && readDateConf < MIN_FIELD_CONF_DATE) {
+    reasons.push(`⚠️ Fecha leída con baja confianza (${readDateConf.toFixed(2)}).`);
+  }
 
-  // ---------- estado (informativo) ----------
-  if (readStatus) reasons.push(`ℹ️ Estado detectado: ${readStatus}.`);
-  else reasons.push("ℹ️ Estado no detectado.");
-
-  // ---------- destino (opcional / solo si expectedToAccounts viene) ----------
+  // ---------- destino (solo si expectedToAccounts viene) ----------
   let okDest = false;
   if (readToAcc) {
     okDest = expectedAccs.some((acc) => String(readToAcc).includes(acc) || acc.includes(String(readToAcc)));
@@ -607,93 +475,87 @@ function buildReasonsAndDecide({
       reasons.push(`ℹ️ Destino leído: ${readToAcc} (no se valida porque no mandaste expectedToAccounts).`);
     }
   } else {
-    reasons.push("ℹ️ Destino no detectado (muy común en comprobantes físicos o capturas).");
+    reasons.push("ℹ️ Destino no detectado (común en capturas/formatos).");
   }
 
-  // ---------- QR (solo aporta si decodifica) ----------
-  let qrMismatch = false;
-  let qrStrongOk = false;
+  // ---------- referencia/transactionId (verificación adicional, no obligatoria) ----------
+  const hasRef = !!(readRef && readRef.length >= 5);
+  if (hasRef) reasons.push(`✅ Referencia detectada: ${readRef}.`);
+  else reasons.push("ℹ️ Referencia no detectada.");
 
-  if (qrInfo?.decoded) {
-    reasons.push(`✅ QR decodificado (${qrInfo.method || "?"}).`);
-    const qrOk = qrContainsAnyAccount(qrInfo.text, expectedAccs);
-    if (checkDestinations) {
-      if (qrOk) {
-        qrStrongOk = true;
-        reasons.push("✅ QR contiene un destino permitido.");
-      } else {
-        qrMismatch = true;
-        reasons.push("❌ QR no contiene destinos permitidos.");
-      }
-    } else {
-      reasons.push("ℹ️ QR decodificado, pero no se valida destino (no mandaste expectedToAccounts).");
-    }
+  if (readTxnId && readTxnId.length >= 5) reasons.push(`ℹ️ ID transacción detectado: ${readTxnId}.`);
+
+  // ---------- canal (banco/app) ----------
+  if (readChannel) reasons.push(`ℹ️ Canal detectado: ${readChannel}.`);
+
+  // ---------- estado (señal extra) ----------
+  const statusOkSignal = labelLooksSuccessful(readStatus);
+  if (readStatus) {
+    reasons.push(`ℹ️ Estado detectado: ${readStatus}.`);
+    if (!statusOkSignal) reasons.push("⚠️ El estado no suena claramente a pago exitoso (señal suave).");
   } else {
-    reasons.push("ℹ️ QR no decodificado (no bloquea verificación).");
+    reasons.push("ℹ️ Estado no detectado.");
   }
 
-  // ---------- tamper (NO bloquea fuerte; solo baja confianza si alto) ----------
-  const aiScore = clamp01(tamperAI?.score);
-  const forScore = clamp01(forensic?.score);
-
-  // FinalScore: damos más peso a IA (forense real falla mucho en screenshots)
-  const tScore = clamp01(Math.max(aiScore, 0.6 * forScore));
-
-  if (forensic?.ok) {
-    if (forScore >= TAMPER_HIGH) reasons.push("⚠️ Forense: posible edición (señal fuerte).");
-    else if (forScore >= TAMPER_MODERATE) reasons.push("⚠️ Forense: posible edición (señal moderada).");
-    else reasons.push("✅ Forense: sin señales fuertes.");
+  // ---------- integridad (solo señales de contenido) ----------
+  const iScore = clamp01(integrity?.score);
+  if (integrity?.signals?.length) {
+    reasons.push(`⚠️ Señales de posible inconsistencia: ${integrity.signals.slice(0, 3).join(", ")}.`);
   } else {
-    reasons.push("ℹ️ Forense no disponible.");
+    reasons.push("✅ Sin señales fuertes de inconsistencia en el contenido.");
   }
-
-  if (aiScore >= TAMPER_HIGH) reasons.push("⚠️ IA: posible edición (señal fuerte).");
-  else if (aiScore >= TAMPER_MODERATE) reasons.push("⚠️ IA: posible edición (señal moderada).");
-  else reasons.push("✅ IA: sin señales fuertes.");
 
   // =========================
   // Reglas de decisión
   // =========================
 
-  // 1) Si fecha o monto contradicen -> rechazo (esto sí es crítico)
+  // 1) Si monto o fecha contradicen -> rechazo
   if (amountCmp.exp != null && amountCmp.read != null && !okAmount) {
-    return { suggested_status: "rechazado", confidence: 0.90, reasons: reasons.slice(0, 14), tamperFinal: tScore };
+    return { suggested_status: "rechazado", confidence: 0.90, reasons: reasons.slice(0, 14), integrityFinal: iScore };
   }
   if (readDate && expDate && !okDate) {
-    return { suggested_status: "rechazado", confidence: 0.90, reasons: reasons.slice(0, 14), tamperFinal: tScore };
+    return { suggested_status: "rechazado", confidence: 0.90, reasons: reasons.slice(0, 14), integrityFinal: iScore };
   }
 
-  // 2) Si el usuario mandó expectedToAccounts y logramos leer destino y NO coincide -> rechazo
-  //    (pero NO rechazamos si no pudimos leer destino)
+  // 2) Si mandaste expectedToAccounts y logramos leer destino y NO coincide -> rechazo
   if (checkDestinations && readToAcc && !okDest) {
-    // si QR decodificó y además contradice, más fuerte
-    const conf = qrMismatch ? 0.92 : 0.88;
-    return { suggested_status: "rechazado", confidence: conf, reasons: reasons.slice(0, 14), tamperFinal: tScore };
+    return { suggested_status: "rechazado", confidence: 0.88, reasons: reasons.slice(0, 14), integrityFinal: iScore };
   }
 
-  // 3) Verificado: monto+fecha OK. Destino/ref no obligatorios (por variedad de bancos)
-  //    Si tamper alto, bajamos a pendiente.
-  const tamperBlocksVerify = tScore >= TAMPER_HIGH;
+  // 3) Para “verificado”: monto+fecha OK + confianza mínima en campos
+  //    (si confianza baja => pendiente)
+  const confBlocksVerify =
+    (readAmount != null && readAmountConf < MIN_FIELD_CONF_AMOUNT) ||
+    (readDate != null && readDateConf < MIN_FIELD_CONF_DATE);
 
-  if (okAmount && okDate && !tamperBlocksVerify) {
-    // sube confianza si hay señales extra
+  if (okAmount && okDate && !confBlocksVerify) {
     let conf = 0.86;
+
     if (hasRef) conf += 0.03;
-    if (qrStrongOk) conf += 0.03;
     if (checkDestinations && okDest) conf += 0.03;
+    if (statusOkSignal) conf += 0.02;
+
+    // si integrity score está alto, bajamos
+    if (iScore >= 0.70) conf -= 0.10;
+    else if (iScore >= 0.45) conf -= 0.05;
 
     conf = Math.max(MIN_CONF_VERIFY, Math.min(0.95, conf));
 
-    return { suggested_status: "verificado", confidence: conf, reasons: reasons.slice(0, 14), tamperFinal: tScore };
+    // si el estado NO suena exitoso, mejor lo dejamos pendiente (a menos que el usuario quiera ignorar estado)
+    if (readStatus && !statusOkSignal) {
+      return { suggested_status: "pendiente_revision", confidence: 0.70, reasons: reasons.slice(0, 14), integrityFinal: iScore };
+    }
+
+    return { suggested_status: "verificado", confidence: conf, reasons: reasons.slice(0, 14), integrityFinal: iScore };
   }
 
-  // 4) Si está todo bien pero tamper alto => pendiente
-  if (okAmount && okDate && tamperBlocksVerify) {
-    return { suggested_status: "pendiente_revision", confidence: 0.68, reasons: reasons.slice(0, 14), tamperFinal: tScore };
+  // 4) Si está todo bien pero con baja confianza => pendiente
+  if (okAmount && okDate && confBlocksVerify) {
+    return { suggested_status: "pendiente_revision", confidence: 0.68, reasons: reasons.slice(0, 14), integrityFinal: iScore };
   }
 
   // 5) Si falta algo (monto o fecha no legible) => pendiente
-  return { suggested_status: "pendiente_revision", confidence: 0.66, reasons: reasons.slice(0, 14), tamperFinal: tScore };
+  return { suggested_status: "pendiente_revision", confidence: 0.66, reasons: reasons.slice(0, 14), integrityFinal: iScore };
 }
 
 // =========================
@@ -717,10 +579,11 @@ app.get("/", (_, res) => {
     model: process.env.AI_MODEL || "gpt-4o-mini",
     expectedToAccounts: DEFAULT_EXPECTED_TO_ACCOUNTS,
     expectedAmountIsThousands: EXPECTED_AMOUNT_IS_THOUSANDS,
-    rules: {
-      REQUIRE_REFERENCE_FOR_VERIFY,
-      REQUIRE_DESTINATION_FOR_VERIFY,
-      REQUIRE_QR_DECODE_FOR_VERIFY,
+    validations: {
+      minFieldConfAmount: MIN_FIELD_CONF_AMOUNT,
+      minFieldConfDate: MIN_FIELD_CONF_DATE,
+      maxImageBytes: MAX_IMAGE_BYTES,
+      allowedMimes: Array.from(ALLOWED_MIMES),
     },
     time: new Date().toISOString(),
   });
@@ -744,6 +607,27 @@ app.post("/verify-consignacion", async (req, res) => {
       expectedToAccounts,
     } = req.body || {};
 
+    // 0) Validaciones input (extra)
+    if (expectedAmount == null || normalizeStr(expectedAmount) === "") {
+      return res.status(400).json({
+        ok: false,
+        confidence: 0,
+        suggested_status: "pendiente_revision",
+        reasons: ["Falta expectedAmount"],
+      });
+    }
+
+    const expDateNorm = normalizeDateYYYYMMDD(expectedDate);
+    if (!expectedDate || !expDateNorm) {
+      return res.status(400).json({
+        ok: false,
+        confidence: 0,
+        suggested_status: "pendiente_revision",
+        reasons: ["Falta expectedDate o no tiene formato válido (usa YYYY-MM-DD o DD/MM/YYYY)"],
+      });
+    }
+    expectedDate = expDateNorm;
+
     // imageUrl -> base64
     if ((!imageBase64 || !imageMime) && imageUrl) {
       const got = await fetchImageAsBase64(imageUrl);
@@ -751,58 +635,124 @@ app.post("/verify-consignacion", async (req, res) => {
       imageMime = got.imageMime;
     }
 
-    if ((!imageBase64 || !imageMime) || expectedAmount == null || !expectedDate) {
+    if (!imageBase64 || !imageMime) {
       return res.status(400).json({
         ok: false,
         confidence: 0,
         suggested_status: "pendiente_revision",
-        reasons: ["Faltan imageBase64+imageMime (o imageUrl), expectedAmount o expectedDate"],
+        reasons: ["Faltan imageBase64+imageMime (o imageUrl)"],
       });
     }
 
+    imageMime = String(imageMime).split(";")[0].trim().toLowerCase();
+
+    if (!ALLOWED_MIMES.has(imageMime)) {
+      return res.status(400).json({
+        ok: false,
+        confidence: 0,
+        suggested_status: "pendiente_revision",
+        reasons: [`imageMime no permitido: ${imageMime}`],
+      });
+    }
+
+    // Base64 -> buffer + tamaño + magic bytes
+    let buf;
+    try {
+      buf = Buffer.from(String(imageBase64), "base64");
+    } catch {
+      return res.status(400).json({
+        ok: false,
+        confidence: 0,
+        suggested_status: "pendiente_revision",
+        reasons: ["imageBase64 inválido (no se pudo decodificar)"],
+      });
+    }
+
+    if (!buf || buf.length < 2000) {
+      return res.status(400).json({
+        ok: false,
+        confidence: 0,
+        suggested_status: "pendiente_revision",
+        reasons: ["Imagen muy pequeña o corrupta"],
+      });
+    }
+
+    if (buf.length > MAX_IMAGE_BYTES) {
+      return res.status(400).json({
+        ok: false,
+        confidence: 0,
+        suggested_status: "pendiente_revision",
+        reasons: [`Imagen excede el límite de ${Math.round(MAX_IMAGE_BYTES / (1024 * 1024))}MB`],
+      });
+    }
+
+    const magicMime = detectMimeFromMagic(buf);
+    if (!magicMime) {
+      return res.status(400).json({
+        ok: false,
+        confidence: 0,
+        suggested_status: "pendiente_revision",
+        reasons: ["No se pudo reconocer el tipo real de imagen (magic bytes)"],
+      });
+    }
+
+    if (magicMime !== imageMime) {
+      return res.status(400).json({
+        ok: false,
+        confidence: 0,
+        suggested_status: "pendiente_revision",
+        reasons: [`imageMime (${imageMime}) no coincide con el tipo real (${magicMime})`],
+      });
+    }
+
+    const imgHash = sha256Hex(buf);
     const dataUrl = asDataUrl(imageMime, imageBase64);
 
-    // ======================
-    // 1) QR decode (mejorado)
-    // ======================
-    const qrInfo = await decodeQrFromDataUrl(dataUrl);
-    console.log(
-      `[${reqId}] QR: decoded=${qrInfo.decoded} present=${qrInfo.present} method=${qrInfo.method || "-"} err=${qrInfo.error || "-"}`
-    );
-    if (qrInfo.decoded) console.log(`[${reqId}] QR text:`, short(qrInfo.text, 260));
+    // expectedToAccounts normalizado
+    const expectedAccs =
+      Array.isArray(expectedToAccounts) && expectedToAccounts.length
+        ? expectedToAccounts
+        : DEFAULT_EXPECTED_TO_ACCOUNTS;
+
+    // expectedAmount normalizado + sanity
+    const expAmtNormalized = normalizeExpectedAmountCOP(expectedAmount);
+    if (expAmtNormalized == null || expAmtNormalized <= 0) {
+      return res.status(400).json({
+        ok: false,
+        confidence: 0,
+        suggested_status: "pendiente_revision",
+        reasons: ["expectedAmount inválido (no se pudo normalizar)"],
+      });
+    }
+    // opcional: evita montos absurdos por error de input
+    if (expAmtNormalized > 200_000_000) {
+      return res.status(400).json({
+        ok: false,
+        confidence: 0,
+        suggested_status: "pendiente_revision",
+        reasons: ["expectedAmount demasiado alto (revisa el input)"],
+      });
+    }
 
     // ======================
-    // 2) Forense (suave)
-    // ======================
-    const forensic = await forensicTamper(dataUrl);
-    console.log(`[${reqId}] Forensic: ok=${forensic.ok} score=${forensic.score?.toFixed?.(3) ?? forensic.score}`);
-
-    // ======================
-    // 3) IA: extracción (mejor prompt para montos)
+    // IA: extracción (sin QR, sin forense)
     // ======================
     const openai = getOpenAI();
     const model = process.env.AI_MODEL || "gpt-4o-mini";
-    console.log(`[${reqId}] OpenAI model=${model}`);
-
-    const expectedAccs = Array.isArray(expectedToAccounts) && expectedToAccounts.length
-      ? expectedToAccounts
-      : DEFAULT_EXPECTED_TO_ACCOUNTS;
-
-    const expAmtNormalized = normalizeExpectedAmountCOP(expectedAmount);
+    console.log(`[${reqId}] OpenAI model=${model} imgHash=${imgHash.slice(0, 12)}... size=${buf.length}`);
 
     const system =
-      "Eres un extractor estricto de comprobantes de pago en Colombia (Nequi, Daviplata, Bancolombia, Wompi, PSE, corresponsales, comprobantes físicos). " +
+      "Eres un extractor estricto de comprobantes de pago en Colombia (Nequi, Daviplata, Bancolombia, PSE, Wompi, corresponsales, comprobantes físicos). " +
       "Tu trabajo NO es decidir 'verificado'. Tu trabajo es EXTRAER campos con alta precisión.\n\n" +
-      "REGLAS IMPORTANTES PARA MONTO (COP):\n" +
-      "1) Si ves '45.000' debes devolver 45000 (sin separadores).\n" +
-      "2) Si ves '134.000' devuelve 134000.\n" +
-      "3) Si el texto muestra separadores de miles pero tú solo alcanzas a leer '45', intenta inferir si realmente es 45000 y explica en reason.\n" +
-      "4) No inventes montos. Si no es legible: value=null.\n\n" +
+      "REGLAS IMPORTANTES:\n" +
+      "1) NO inventes. Si no es legible: value=null.\n" +
+      "2) Para monto COP: devuelve entero sin separadores (45.000 => 45000).\n" +
+      "3) Fecha: ideal YYYY-MM-DD; si ves DD/MM/YYYY también sirve.\n" +
+      "4) Si ves inconsistencias (texto raro, cortes, sobreposiciones, partes repetidas), llena integrity.\n\n" +
       "FORMATO:\n" +
       "- Devuelve SOLO JSON válido (sin markdown).\n" +
       "- confidence 0..1.\n" +
-      "- Cada campo: value + confidence + reason.\n" +
-      "- tamper.score 0..1 (alto = posible edición). Si dudas, sube score un poco.\n";
+      "- Cada campo: value + confidence + reason.\n";
 
     const user =
       `DATOS ESPERADOS:\n` +
@@ -812,14 +762,16 @@ app.post("/verify-consignacion", async (req, res) => {
       `- expectedDateTime (opcional): ${expectedDateTime || ""}\n` +
       `- expectedToAccounts (opcional): ${expectedAccs.join(", ")}\n\n` +
       `EXTRAE del comprobante (si aparece):\n` +
-      `- amount (COP como número entero: 45000)\n` +
-      `- date (YYYY-MM-DD o DD/MM/YYYY)\n` +
-      `- time (HH:mm si puedes)\n` +
-      `- reference / comprobante / autorización\n` +
-      `- toName (si aparece)\n` +
+      `- amount (COP entero)\n` +
+      `- date\n` +
+      `- time (HH:mm)\n` +
+      `- reference\n` +
+      `- transactionId (id/autoriza/comprobante si existe)\n` +
+      `- channel (banco/app/pasarela: Nequi/Bancolombia/PSE/etc)\n` +
+      `- toName\n` +
       `- toAccount (solo dígitos si aparece)\n` +
-      `- statusLabel (ej "Aprobado", "Pago exitoso", "Envío realizado")\n` +
-      `- qrPresent (true/false si ves un QR en la imagen)\n\n` +
+      `- fromAccount (solo dígitos si aparece: tel/cuenta)\n` +
+      `- statusLabel\n\n` +
       `Devuelve SOLO este JSON:\n` +
       `{\n` +
       `  "ok": boolean,\n` +
@@ -829,12 +781,14 @@ app.post("/verify-consignacion", async (req, res) => {
       `    "date": {"value": string|null, "confidence": number, "reason": string},\n` +
       `    "time": {"value": string|null, "confidence": number, "reason": string},\n` +
       `    "reference": {"value": string|null, "confidence": number, "reason": string},\n` +
+      `    "transactionId": {"value": string|null, "confidence": number, "reason": string},\n` +
+      `    "channel": {"value": string|null, "confidence": number, "reason": string},\n` +
       `    "toName": {"value": string|null, "confidence": number, "reason": string},\n` +
       `    "toAccount": {"value": string|null, "confidence": number, "reason": string},\n` +
-      `    "statusLabel": {"value": string|null, "confidence": number, "reason": string},\n` +
-      `    "qrPresent": {"value": boolean|null, "confidence": number, "reason": string}\n` +
+      `    "fromAccount": {"value": string|null, "confidence": number, "reason": string},\n` +
+      `    "statusLabel": {"value": string|null, "confidence": number, "reason": string}\n` +
       `  },\n` +
-      `  "tamper": {"suspected": boolean, "score": number, "signals": string[]},\n` +
+      `  "integrity": {"suspected": boolean, "score": number, "signals": string[]},\n` +
       `  "notes": string[]\n` +
       `}\n`;
 
@@ -861,7 +815,7 @@ app.post("/verify-consignacion", async (req, res) => {
         ok: false,
         confidence: 0,
         extracted: {},
-        tamper: { suspected: false, score: 0, signals: ["json_invalido"] },
+        integrity: { suspected: false, score: 0, signals: ["json_invalido"] },
         notes: ["La IA no devolvió JSON válido."],
         raw: short(out, 900),
       };
@@ -869,7 +823,7 @@ app.post("/verify-consignacion", async (req, res) => {
     ia = ensureVerifyResult(ia);
 
     // ======================
-    // 4) Reglas servidor
+    // Reglas servidor (más verificaciones)
     // ======================
     const decision = buildReasonsAndDecide({
       expectedAmount,
@@ -877,13 +831,7 @@ app.post("/verify-consignacion", async (req, res) => {
       expectedToAccounts: expectedAccs,
       expectedDateTime,
       iaExtract: ia,
-      qrInfo,
-      forensic,
     });
-
-    const aiScore = clamp01(ia?.tamper?.score);
-    const forScore = clamp01(forensic?.score);
-    const tamperFinal = clamp01(Math.max(aiScore, 0.6 * forScore));
 
     const result = {
       ok: true,
@@ -893,30 +841,29 @@ app.post("/verify-consignacion", async (req, res) => {
 
       extracted: ia.extracted,
 
-      tamper: {
-        ai: ia.tamper,
-        forensic: {
-          ok: forensic.ok,
-          score: clamp01(forensic.score),
-          signals: (forensic.signals || []).slice(0, 12),
-          details: forensic.details || null,
-        },
-        finalScore: tamperFinal,
-        finalLevel: tamperFinal >= TAMPER_HIGH ? "high" : tamperFinal >= TAMPER_MODERATE ? "moderate" : "low",
+      integrity: {
+        ai: ia.integrity,
+        finalScore: clamp01(ia?.integrity?.score),
+        finalLevel:
+          clamp01(ia?.integrity?.score) >= 0.70
+            ? "high"
+            : clamp01(ia?.integrity?.score) >= 0.45
+            ? "moderate"
+            : "low",
       },
 
-      qr: {
-        present: !!qrInfo?.present,
-        decoded: !!qrInfo?.decoded,
-        method: qrInfo?.method || null,
-        textShort: qrInfo?.decoded ? short(qrInfo.text, 220) : null,
-        error: qrInfo?.decoded ? null : (qrInfo?.error || null),
+      debug: {
+        reqId,
+        ms: Date.now() - t0,
+        model,
+        imgHash: imgHash.slice(0, 24),
+        imgBytes: buf.length,
       },
-
-      debug: { reqId, ms: Date.now() - t0, model },
     };
 
-    console.log(`[${reqId}] ✅ DONE ${result.suggested_status} in ${result.debug.ms}ms tamperFinal=${result.tamper.finalScore.toFixed(3)}`);
+    console.log(
+      `[${reqId}] ✅ DONE ${result.suggested_status} in ${result.debug.ms}ms integrity=${result.integrity.finalScore.toFixed(3)}`
+    );
     return res.json(result);
   } catch (e) {
     const status = e?.status || e?.response?.status;
@@ -1244,11 +1191,18 @@ app.listen(port, () => console.log("🚀 Server on port", port));
 
 /*
 INSTALACIÓN:
-  npm i express cors openai node-fetch jimp jsqr qrcode-reader dotenv
+  npm i express cors openai node-fetch dotenv
 
-NOTAS:
-- expectedAmount: puedes seguir mandando 45 o 134 (se interpreta como 45000 / 134000).
-- QR: ahora se intenta decodificar con varios preprocesos/recortes/rotaciones.
-- Forense: queda informativo y ya no “rompe” verificaciones (porque en screenshots suele fallar).
-- Verificado: depende fuerte de monto+fecha. Destino/referencia ayudan pero no bloquean.
+CAMBIOS:
+- Eliminado QR y forense completamente.
+- Más verificaciones:
+  - mime permitido
+  - tamaño máximo
+  - magic bytes vs imageMime
+  - normalización estricta expectedDate
+  - sanity expectedAmount
+  - umbral mínimo de confianza para amount/date
+  - validación suave de statusLabel (si no suena exitoso => pendiente)
+  - validación opcional de expectedDateTime (si hay hora y se detecta)
+- Quitado el texto: (diff ..., tol ...).
 */
